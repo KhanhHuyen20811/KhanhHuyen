@@ -1,0 +1,289 @@
+require('dotenv').config();
+const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+const { GoogleGenAI } = require('@google/genai');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Khởi tạo Gemini AI Client
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || 'YOUR_API_KEY' });
+
+// Middleware
+app.use(express.json());
+app.use(express.static('public'));
+app.use('/uploads', express.static('uploads'));
+
+// Đảm bảo thư mục uploads tồn tại
+if (!fs.existsSync('./uploads')) {
+    fs.mkdirSync('./uploads');
+}
+
+// Cấu hình Multer lưu trữ tài liệu
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, 'uploads/'),
+    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+});
+const upload = multer({ storage });
+
+// Khởi tạo Cơ sở dữ liệu SQLite
+const db = new sqlite3.Database('./database.db', (err) => {
+    if (err) console.error('Lỗi kết nối DB:', err);
+    else console.log('Đã kết nối CSDL SQLite thành công.');
+});
+
+// Tạo các bảng dữ liệu
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        category TEXT,
+        filename TEXT,
+        filepath TEXT,
+        extracted_text TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS quizzes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER,
+        title TEXT,
+        questions TEXT, -- JSON string
+        time_limit INTEGER,
+        difficulty TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS quiz_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quiz_id INTEGER,
+        score REAL,
+        total_questions INTEGER,
+        correct_answers INTEGER,
+        user_answers TEXT, -- JSON string
+        weakness_analysis TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+});
+
+// --- API TÀI LIỆU ---
+
+// Tải tài liệu lên & Trích xuất nội dung
+app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'Vui lòng chọn file' });
+
+        const { category } = req.body;
+        const filePath = req.file.path;
+        const ext = path.extname(req.file.originalname).toLowerCase();
+        let extractedText = '';
+
+        if (ext === '.pdf') {
+            const dataBuffer = fs.readFileSync(filePath);
+            const data = await pdfParse(dataBuffer);
+            extractedText = data.text;
+        } else if (ext === '.docx') {
+            const result = await mammoth.extractRawText({ path: filePath });
+            extractedText = result.value;
+        } else if (ext === '.txt') {
+            extractedText = fs.readFileSync(filePath, 'utf8');
+        } else {
+            return res.status(400).json({ error: 'Định dạng file chưa hỗ trợ đọc nội dung.' });
+        }
+
+        const stmt = db.prepare(`INSERT INTO documents (title, category, filename, filepath, extracted_text) VALUES (?, ?, ?, ?, ?)`);
+        stmt.run(req.file.originalname, category || 'Chung', req.file.filename, filePath, extractedText, function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ id: this.lastID, title: req.file.originalname, category });
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Lỗi khi xử lý file: ' + error.message });
+    }
+});
+
+// Lấy danh sách tài liệu
+app.get('/api/documents', (req, res) => {
+    db.all(`SELECT id, title, category, filename, created_at FROM documents ORDER BY id DESC`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// Xóa tài liệu
+app.delete('/api/documents/:id', (req, res) => {
+    db.run(`DELETE FROM documents WHERE id = ?`, [req.params.id], function (err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Đã xóa tài liệu thành công' });
+    });
+});
+
+// --- API TẠO ĐỀ THI BẰNG AI ---
+
+app.post('/api/quizzes/generate', async (req, res) => {
+    const { documentId, numQuestions, difficulty, timeLimit } = req.body;
+
+    db.get(`SELECT extracted_text, title FROM documents WHERE id = ?`, [documentId], async (err, doc) => {
+        if (err || !doc) return res.status(404).json({ error: 'Không tìm thấy tài liệu' });
+
+        try {
+            const prompt = `Bạn là một chuyên gia giáo dục. Hãy dựa vào nội dung tài liệu dưới đây để tạo một bài kiểm tra trắc nghiệm.
+Nội dung tài liệu:
+"""
+${doc.extracted_text.slice(0, 8000)}
+"""
+
+Yêu cầu:
+- Tạo đúng ${numQuestions} câu hỏi trắc nghiệm.
+- Mức độ khó: ${difficulty}.
+- Trả về kết quả HOÀN TOÀN dưới dạng định dạng JSON duy nhất (không chứa markdown codeblock, không thêm lời thoại).
+- Cấu trúc JSON dạng mảng danh sách câu hỏi như sau:
+[
+  {
+    "id": 1,
+    "question": "Nội dung câu hỏi?",
+    "options": {
+      "A": "Đáp án A",
+      "B": "Đáp án B",
+      "C": "Đáp án C",
+      "D": "Đáp án D"
+    },
+    "correctAnswer": "A",
+    "explanation": "Giải thích chi tiết vì sao đáp án này đúng dựa trên nội dung tài liệu."
+  }
+]`;
+
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: prompt,
+            });
+
+            let responseText = response.text.trim();
+            if (responseText.startsWith('```json')) {
+                responseText = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+            }
+
+            const questions = JSON.parse(responseText);
+
+            const stmt = db.prepare(`INSERT INTO quizzes (document_id, title, questions, time_limit, difficulty) VALUES (?, ?, ?, ?, ?)`);
+            stmt.run(documentId, `Bài thi: ${doc.title}`, JSON.stringify(questions), timeLimit, difficulty, function (err) {
+                if (err) return res.status(500).json({ error: err.message });
+                res.json({ quizId: this.lastID, title: `Bài thi: ${doc.title}`, questions, timeLimit });
+            });
+
+        } catch (error) {
+            console.error('Lỗi Gemini AI:', error);
+            res.status(500).json({ error: 'Lỗi khi AI tạo đề thi. Vui lòng thử lại.' });
+        }
+    });
+});
+
+// Lấy thông tin bài thi
+app.get('/api/quizzes/:id', (req, res) => {
+    db.get(`SELECT * FROM quizzes WHERE id = ?`, [req.params.id], (err, row) => {
+        if (err || !row) return res.status(404).json({ error: 'Không tìm thấy bài thi' });
+        row.questions = JSON.parse(row.questions);
+        res.json(row);
+    });
+});
+
+// --- API CHẤM ĐIỂM VÀ LƯU KẾT QUẢ ---
+
+app.post('/api/quizzes/:id/submit', (req, res) => {
+    const quizId = req.params.id;
+    const { userAnswers } = req.body; // Dạng Object { "1": "A", "2": "C" }
+
+    db.get(`SELECT * FROM quizzes WHERE id = ?`, [quizId], async (err, quiz) => {
+        if (err || !quiz) return res.status(404).json({ error: 'Không tìm thấy đề thi' });
+
+        const questions = JSON.parse(quiz.questions);
+        let correctCount = 0;
+        let wrongQuestions = [];
+
+        questions.forEach(q => {
+            const userAns = userAnswers[q.id];
+            if (userAns === q.correctAnswer) {
+                correctCount++;
+            } else {
+                wrongQuestions.push({
+                    question: q.question,
+                    userAnswer: userAns || 'Chưa chọn',
+                    correctAnswer: q.correctAnswer,
+                    explanation: q.explanation
+                });
+            }
+        });
+
+        const totalQuestions = questions.length;
+        const score = Number(((correctCount / totalQuestions) * 10).toFixed(1));
+
+        // AI Phân tích điểm yếu nếu có câu sai
+        let weaknessAnalysis = "Bạn đã làm xuất sắc, không mắc lỗi nào!";
+        if (wrongQuestions.length > 0) {
+            try {
+                const prompt = `Dựa vào danh sách các câu hỏi làm sai sau đây, hãy đưa ra 2-3 dòng nhận xét ngắn gọn đánh giá phần kiến thức người học còn yếu và lời khuyên ôn tập:
+${JSON.stringify(wrongQuestions)}`;
+                const aiRes = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: prompt,
+                });
+                weaknessAnalysis = aiRes.text;
+            } catch (e) {
+                weaknessAnalysis = "Cần ôn tập lại các nội dung đã chọn đáp án sai.";
+            }
+        }
+
+        const stmt = db.prepare(`INSERT INTO quiz_results (quiz_id, score, total_questions, correct_answers, user_answers, weakness_analysis) VALUES (?, ?, ?, ?, ?, ?)`);
+        stmt.run(quizId, score, totalQuestions, correctCount, JSON.stringify(userAnswers), weaknessAnalysis, function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({
+                resultId: this.lastID,
+                score,
+                correctCount,
+                totalQuestions,
+                questions,
+                userAnswers,
+                weaknessAnalysis
+            });
+        });
+    });
+});
+
+// Lấy lịch sử bài thi
+app.get('/api/history', (req, res) => {
+    const query = `
+        SELECT r.id, r.score, r.correct_answers, r.total_questions, r.created_at, q.title as quiz_title, d.title as doc_title
+        FROM quiz_results r
+        JOIN quizzes q ON r.quiz_id = q.id
+        LEFT JOIN documents d ON q.document_id = d.id
+        ORDER BY r.id DESC
+    `;
+    db.all(query, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// Lấy thống kê cho Dashboard
+app.get('/api/dashboard/stats', (req, res) => {
+    db.get(`SELECT 
+        (SELECT COUNT(*) FROM documents) as total_docs,
+        (SELECT COUNT(*) FROM quiz_results) as total_quizzes,
+        (SELECT AVG(score) FROM quiz_results) as avg_score`,
+    [], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({
+            totalDocs: row.total_docs || 0,
+            totalQuizzes: row.total_quizzes || 0,
+            avgScore: row.avg_score ? Number(row.avg_score).toFixed(1) : 0
+        });
+    });
+});
+
+app.listen(PORT, () => {
+    console.log(`SmartQuiz Server đang chạy tại: http://localhost:${PORT}`);
+});
